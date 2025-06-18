@@ -1,256 +1,195 @@
-"""
-A set of functions for graph construction and manipulation using patch embedding.
-This version includes a new implementation using a Vision Transformer for feature extraction.
-"""
+# Copyright (c) MONAI Consortium
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
 import os
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.data import Data
-
-# Mock implementations for standalone execution
-class MockConfig:
-    def get(self, key):
-        return 'graphs'
-def get_config(): return MockConfig()
-def get_device(): return 'cuda' if torch.cuda.is_available() else 'cpu'
-def get_transformations(): return (lambda x: x), None, None, None, None
-
-
-__all__ = ['image_to_graph_vit', 'extract_patches', 'get_node_edges']
-
-"""
-An implementation of a 3D Vision Transformer Autoencoder, designed to be a 
-transformer-based counterpart to the convolutional AutoEncoder3D.
-"""
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
-from monai.networks.nets import ViT
-from monai.networks.blocks import Convolution
-from monai.networks.layers.factories import Act, Norm
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from torch_geometric.data import Data
 
+from monai.networks.blocks import Convolution
+from monai.networks.blocks.patchembedding import PatchEmbeddingBlock
+from monai.networks.blocks.transformerblock import TransformerBlock
+from monai.networks.layers.factories import Act, Norm
 from monai.transforms import (
     Compose,
-    LoadImaged,
     EnsureChannelFirstd,
+    LoadImaged,
     Resized,
-    ScaleIntensityRanged
+    ScaleIntensityRanged,
 )
-
-from sklearn.decomposition import PCA 
-
-__all__ = ["ViTAutoEncoder3D"]
+from monai.utils import deprecated_arg
 
 
-class ViTAutoEncoder3D(nn.Module):
+__all__ = [
+    "ViT",
+    "image_to_graph_vit",
+    "extract_patches",
+    "get_node_edges",
+    "get_patch_voxel_indices",
+    "get_patch_centroid",
+    "get_patch_labels",
+]
+
+
+class ViT(nn.Module):
     """
-    A 3D Vision Transformer (ViT) based Autoencoder.
+    Vision Transformer (ViT), based on: "Dosovitskiy et al.,
+    An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale <https://arxiv.org/abs/2010.11929>"
 
-    This network is composed of a ViT-based encoder and a convolutional decoder.
-    It's designed as a transformer-based alternative to a standard convolutional autoencoder,
-    maintaining a similar configurable structure. The ViT encoder creates a latent
-    representation of the input, and the convolutional decoder reconstructs the image
-    from this latent space.
-
-    The forward pass returns both the latent space and the reconstructed image,
-    making it suitable for self-supervised pre-training.
-
-    Args:
-        spatial_dims: Number of spatial dimensions (must be 3).
-        in_channels: Number of input channels.
-        out_channels: Number of output channels for the reconstructed image.
-        
-        -- ViT Encoder Parameters --
-        img_size: The size of the input image spatial dimensions (D, H, W).
-                  Your data loader must provide patches of this exact size.
-        patch_size: The size of the patches to be extracted from the input image.
-        hidden_size: Dimension of the ViT latent space.
-        mlp_dim: Dimension of the MLP layer in the ViT transformer block.
-        num_heads: Number of attention heads.
-        num_layers: Number of transformer blocks.
-        
-        -- Convolutional Decoder Parameters --
-        decoder_channels: Sequence of channels for the decoder's convolutional blocks.
-        decoder_strides: Sequence of strides for the transposed convolutions in the decoder.
-                         Should have the same length as `decoder_channels`.
-        
-        -- General Parameters --
-        act: Activation type and arguments. Defaults to PReLU.
-        norm: Feature normalization type and arguments. Defaults to instance norm.
-        dropout: Dropout ratio. Defaults to no dropout.
-        bias: Whether to have a bias term in decoder convolution blocks. Defaults to True.
-        name: A name for the model.
+    ViT supports Torchscript but only works for Pytorch after 1.8.
     """
 
+    @deprecated_arg(
+        name="pos_embed", since="1.2", removed="1.4", new_name="proj_type", msg_suffix="please use `proj_type` instead."
+    )
     def __init__(
         self,
-        spatial_dims: int,
         in_channels: int,
-        out_channels: int,
-        # ViT Encoder parameters
-        img_size: Sequence[int],
-        patch_size: Sequence[int],
-        hidden_size: int = 256,
-        mlp_dim: int = 512,
-        num_heads: int = 4,
+        img_size: Sequence[int] | int,
+        patch_size: Sequence[int] | int,
+        hidden_size: int = 768,
+        mlp_dim: int = 3072,
         num_layers: int = 12,
-        # Decoder parameters
-        decoder_channels: Sequence[int] = (256, 128, 64),
-        decoder_strides: Sequence[int] = (2, 2, 2),
-        # General NN parameters
-        act: tuple | str | None = Act.PRELU,
-        norm: tuple | str = Norm.INSTANCE,
-        dropout: float = 0.0,
-        bias: bool = True,
-        name: str = 'ViTAutoEncoder3D',
+        num_heads: int = 12,
+        pos_embed: str = "conv",
+        proj_type: str = "conv",
+        pos_embed_type: str = "learnable",
+        classification: bool = False,
+        num_classes: int = 2,
+        dropout_rate: float = 0.0,
+        spatial_dims: int = 3,
+        post_activation="Tanh",
+        qkv_bias: bool = False,
+        save_attn: bool = False,
+        # my add
+        name="ViT",
     ) -> None:
+        """
+        Args:
+            in_channels (int): dimension of input channels.
+            img_size (Union[Sequence[int], int]): dimension of input image.
+            patch_size (Union[Sequence[int], int]): dimension of patch size.
+            hidden_size (int, optional): dimension of hidden layer. Defaults to 768.
+            mlp_dim (int, optional): dimension of feedforward layer. Defaults to 3072.
+            num_layers (int, optional): number of transformer blocks. Defaults to 12.
+            num_heads (int, optional): number of attention heads. Defaults to 12.
+            proj_type (str, optional): patch embedding layer type. Defaults to "conv".
+            pos_embed_type (str, optional): position embedding type. Defaults to "learnable".
+            classification (bool, optional): bool argument to determine if classification is used. Defaults to False.
+            num_classes (int, optional): number of classes if classification is used. Defaults to 2.
+            dropout_rate (float, optional): fraction of the input units to drop. Defaults to 0.0.
+            spatial_dims (int, optional): number of spatial dimensions. Defaults to 3.
+            post_activation (str, optional): add a final acivation function to the classification head
+                when `classification` is True. Default to "Tanh" for `nn.Tanh()`.
+                Set to other values to remove this function.
+            qkv_bias (bool, optional): apply bias to the qkv linear layer in self attention block. Defaults to False.
+            save_attn (bool, optional): to make accessible the attention in self attention block. Defaults to False.
+
+        .. deprecated:: 1.4
+            ``pos_embed`` is deprecated in favor of ``proj_type``.
+
+        Examples::
+
+            # for single channel input with image size of (96,96,96), conv position embedding and segmentation backbone
+            >>> net = ViT(in_channels=1, img_size=(96,96,96), proj_type='conv', pos_embed_type='sincos')
+
+            # for 3-channel with image size of (128,128,128), 24 layers and classification backbone
+            >>> net = ViT(in_channels=3, img_size=(128,128,128), proj_type='conv', pos_embed_type='sincos', classification=True)
+
+            # for 3-channel with image size of (224,224), 12 layers and classification backbone
+            >>> net = ViT(in_channels=3, img_size=(224,224), proj_type='conv', pos_embed_type='sincos', classification=True,
+            >>>           spatial_dims=2)
+
+        """
+
         super().__init__()
 
-        if spatial_dims != 3:
-            raise ValueError("This implementation is designed for 3D spatial dimensions.")
+        if not (0 <= dropout_rate <= 1):
+            raise ValueError("dropout_rate should be between 0 and 1.")
 
-        if len(decoder_channels) != len(decoder_strides):
-            raise ValueError("Decoder channels and strides must have the same length.")
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size should be divisible by num_heads.")
 
-        self.name = name
-        self.spatial_dims = spatial_dims
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.hidden_size = hidden_size
-        self.img_size = img_size
-        
-
-        # 1. --- Define the ViT Encoder ---
-        self.encoder = ViT(
+        self.classification = classification
+        self.patch_embedding = PatchEmbeddingBlock(
             in_channels=in_channels,
             img_size=img_size,
             patch_size=patch_size,
             hidden_size=hidden_size,
-            mlp_dim=mlp_dim,
-            num_layers=num_layers,
             num_heads=num_heads,
-            classification=False,  
-            dropout_rate=dropout,
+            proj_type=proj_type,
+            pos_embed_type=pos_embed_type,
+            dropout_rate=dropout_rate,
             spatial_dims=spatial_dims,
         )
-
-        # 2. --- Define the Convolutional Decoder ---
-        
-        # Calculate the spatial size of the feature map after the ViT encoder
-        self.patch_grid_size = [i // p for i, p in zip(img_size, patch_size)]
-        
-        self.decoder = self._get_decode_module(
-            in_channels=hidden_size,
-            channels=decoder_channels,
-            strides=decoder_strides,
-            act=act,
-            norm=norm,
-            dropout=dropout,
-            bias=bias
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(hidden_size, mlp_dim, num_heads, dropout_rate, qkv_bias, save_attn)
+                for i in range(num_layers)
+            ]
         )
-        
-        # Final layer to map to the desired number of output channels
-        self.final_conv = Convolution(
-            spatial_dims=spatial_dims,
-            in_channels=decoder_channels[-1],
-            out_channels=out_channels,
-            kernel_size=1, # 1x1x1 convolution
-            conv_only=True,
-            bias=True # Final layer usually has a bias
-        )
+        self.norm = nn.LayerNorm(hidden_size)
+        if self.classification:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+            if post_activation == "Tanh":
+                self.classification_head = nn.Sequential(nn.Linear(hidden_size, num_classes), nn.Tanh())
+            else:
+                self.classification_head = nn.Linear(hidden_size, num_classes)  # type: ignore
 
+        self.name = name
 
-    def _get_decode_module(
-        self, in_channels: int, channels: Sequence[int], strides: Sequence[int], **kwargs
-    ) -> nn.Sequential:
-        """
-        Builds the decoder from a sequence of transposed convolutional blocks.
-        """
-        decode = nn.Sequential()
-        layer_channels = in_channels
-
-        for i, (c, s) in enumerate(zip(channels, strides)):
-            layer = Convolution(
-                spatial_dims=self.spatial_dims,
-                in_channels=layer_channels,
-                out_channels=c,
-                strides=s,
-                kernel_size=s,      
-                is_transposed=True,
-                padding=0,          
-                output_padding=0,   
-                **kwargs
-            )
-            decode.add_module(f"decode_{i}", layer)
-            layer_channels = c
-            
-        return decode
-
-
-    def forward(self, x: torch.Tensor):
-        """
-        Forward pass for the ViT Autoencoder.
-
-        Args:
-            x (torch.Tensor): Input tensor with shape (B, C_in, D, H, W).
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - latent (torch.Tensor): The latent feature map from the encoder,
-                  reshaped to its spatial grid `(B, hidden_size, D', H', W')`.
-                - reconstruction (torch.Tensor): The reconstructed output image
-                  with shape `(B, C_out, D, H, W)`.
-        """
-        # --- Encode ---
-        # Encoder output is a sequence of tokens: (batch_size, num_patches, hidden_size)
-        # Resize input if needed
-        latent_tokens, _ = self.encoder(x)
-        
-        # --- Reshape latent space for decoder ---
-        # Reshape token sequence into a 3D feature map
-        # (B, num_patches, C) -> (B, C, num_patches) -> (B, C, D', H', W')
-        b, n, c = latent_tokens.shape
-        if c != self.hidden_size:
-            raise ValueError("Latent token dimension mismatch.")
-            
-        latent_spatial = latent_tokens.transpose(1, 2).view(
-            b, c, *self.patch_grid_size
-        )
-        
-        # --- Decode ---
-        reconstruction = self.decoder(latent_spatial)
-        reconstruction = self.final_conv(reconstruction)
-        
-        return latent_spatial, reconstruction
-
+    def forward(self, x):
+        x = self.patch_embedding(x)
+        if hasattr(self, "cls_token"):
+            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_token, x), dim=1)
+        hidden_states_out = []
+        for blk in self.blocks:
+            x = blk(x)
+            hidden_states_out.append(x)
+        x = self.norm(x)
+        if hasattr(self, "classification_head"):
+            x = self.classification_head(x[:, 0])
+        return x, hidden_states_out
 
 def image_to_graph_vit(
     data: dict,
-    vit_model: torch.nn.Module,
+    vit_model: ViT,  
     patch_size=(8, 8, 8),
     k=10,
-    num_important_features=20, 
-    write_to_file: str = None,
-    saved_path=None,
-    saved_model=None
+    num_important_features=20,
+    write_to_file: str | None = None,
+    saved_path: str | None = None,
+    saved_model: str | None = None,
 ):
     """
-    Constructs a graph by reducing the feature dimensionality of each node.
+    Constructs a graph from an image using a plain ViT model for feature extraction.
 
-    This function feeds the entire image to a ViT, unpacks the feature grid for all
-    nodes, and then uses PCA to reduce the feature dimension (e.g., from 256 to 20)
-    before building the graph.
+    This function feeds an entire image to a ViT, uses its output token sequence as node
+    features, reduces their dimensionality with PCA, and then builds the graph.
+    It does NOT require the ViTAutoEncoder3D or a decoder.
 
     Args:
         data (dict): Dictionary containing 'image' and 'label' paths.
-        vit_model (torch.nn.Module): The pre-trained ViT model.
+        vit_model (ViT): The pre-trained plain ViT model (must be initialized with classification=False).
         patch_size (tuple): The size of patches corresponding to each node in the ViT grid.
         k (int): Number of nearest neighbors for graph edge construction.
-        num_important_features (int): The target number of features after dimensionality reduction.
+        num_important_features (int): Target number of features after PCA reduction.
         write_to_file (str, optional): Path to save the graph and map files.
         saved_path (str, optional): Path to the directory with saved model weights.
         saved_model (str, optional): Specific model file name to load.
@@ -262,13 +201,15 @@ def image_to_graph_vit(
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    transform_pipeline = Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        Resized(keys=["image"], spatial_size=(112, 112, 72), mode='trilinear', align_corners=False),
-        Resized(keys=["label"], spatial_size=(112, 112, 72), mode='nearest'),
-        ScaleIntensityRanged(keys=["image"], a_min=0.0, a_max=1.0, b_min=0.0, b_max=1.0, clip=True),
-    ])
+    transform_pipeline = Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            Resized(keys=["image"], spatial_size=(112, 112, 72), mode="trilinear", align_corners=False),
+            Resized(keys=["label"], spatial_size=(112, 112, 72), mode="nearest"),
+            ScaleIntensityRanged(keys=["image"], a_min=0.0, a_max=1.0, b_min=0.0, b_max=1.0, clip=True),
+        ]
+    )
 
     try:
         processed_data = transform_pipeline(data)
@@ -276,15 +217,17 @@ def image_to_graph_vit(
         print(f"Error processing data for subject {data.get('subject', 'N/A')}: {e}")
         return None, None
 
-    image_volume = processed_data['image']
-    label_volume = processed_data['label']
+    image_volume = processed_data["image"]
+    label_volume = processed_data["label"]
 
     image_tensor = torch.tensor(image_volume, dtype=torch.float).unsqueeze(0).to(device)
 
+    # Note: Model loading logic might need adjustment if model names don't match
     if saved_path:
-        model_files = [n for n in os.listdir(saved_path) if vit_model.name.upper() in n and n.endswith('.pth')]
+        model_name_key = "ViT_4CLASS"
+        model_files = [n for n in os.listdir(saved_path) if model_name_key.upper() in n and n.endswith(".pth")]
         if not model_files:
-            raise FileNotFoundError(f"No model checkpoint found for {vit_model.name} in {saved_path}")
+            raise FileNotFoundError(f"No model checkpoint found for {model_name_key} in {saved_path}")
         last_model = saved_model if saved_model else sorted(model_files)[-1]
         vit_model.load_state_dict(torch.load(os.path.join(saved_path, last_model), map_location=device))
 
@@ -292,42 +235,31 @@ def image_to_graph_vit(
     vit_model.eval()
 
     with torch.no_grad():
-        output = vit_model(image_tensor)
+        node_features_raw, _ = vit_model(image_tensor)
 
-    if isinstance(output, tuple):
-        all_node_features = output[0]
+    # The raw output from ViT (with classification=False) is a 3D tensor:
+    # (batch_size, num_patches, hidden_size)
+    if node_features_raw.dim() == 3:
+        # Remove the batch dimension to get (num_patches, hidden_size)
+        all_node_features = node_features_raw.squeeze(0)
     else:
-        all_node_features = output
+        raise ValueError(f"Unsupported shape for node features from ViT: {node_features_raw.shape}")
 
-    if all_node_features.dim() == 5:
-        b, d, d1, d2, d3 = all_node_features.shape
-        all_node_features = all_node_features.permute(0, 2, 3, 4, 1).reshape(-1, d)
-    elif all_node_features.dim() == 3:
-        all_node_features = all_node_features.squeeze(0)
-    else:
-        raise ValueError(f"Unsupported shape for node features: {all_node_features.shape}")
-
-    
-    
-    # Ensure the number of features to keep is not more than the original number
+    # --- Reduce feature dimension using PCA ---
     original_feature_dim = all_node_features.shape[1]
     if num_important_features > original_feature_dim:
-        print(f"Warning: Requested {num_important_features} features, but only {original_feature_dim} are available. Using {original_feature_dim}.")
+        print(
+            f"Warning: Requested {num_important_features} features, but only {original_feature_dim} are available. "
+            f"Using {original_feature_dim}."
+        )
         num_important_features = original_feature_dim
 
-    # PCA works with NumPy on the CPU
     features_np = all_node_features.cpu().numpy()
-
-    # Initialize and apply PCA
     pca = PCA(n_components=num_important_features)
     reduced_features_np = pca.fit_transform(features_np)
-    
-    # Convert back to a torch tensor on the correct device
     node_features = torch.tensor(reduced_features_np, dtype=torch.float, device=device)
-    
 
-
-    # --- Generate spatial and label info for ALL nodes ---
+    # --- Generate spatial and label info for all nodes (this logic is unchanged) ---
     grid_size = tuple(s // p for s, p in zip((112, 112, 72), patch_size))
     centroids, labels, voxels = [], [], []
     for z in range(grid_size[0]):
@@ -340,42 +272,23 @@ def image_to_graph_vit(
 
     centroids = np.array(centroids)
 
-    # --- Build the final graph using ALL nodes but with REDUCED features ---
+    # --- Build the final graph using all nodes but with reduced features ---
     graph = Data(
-        x=node_features, # Use the new feature-reduced tensor
+        x=node_features,
         edge_index=torch.tensor(get_node_edges(centroids=centroids, k=k).T, dtype=torch.long),
-        y=torch.tensor(labels, dtype=torch.long)
+        y=torch.tensor(labels, dtype=torch.long),
     )
 
-    if write_to_file:
-        fold = get_config().get('GRAPH_FOLDER')
-        subject = data['subject']
-        subject_folder = os.path.join(write_to_file, fold, subject)
+    if write_to_file and "subject" in data:
+        subject = data["subject"]
+        subject_folder = os.path.join(write_to_file, "graphs", subject)
         os.makedirs(subject_folder, exist_ok=True)
         torch.save(graph, os.path.join(subject_folder, f"{subject}.graph"))
         torch.save(voxels, os.path.join(subject_folder, f"{subject}.map"))
 
     return graph, centroids
 
-
-def extract_patches(
-        multi_channel_volume,
-        patch_size=(8, 8, 8),
-        stride=(8, 8, 8),
-        min_nonzero_ratio=0.1
-    ):
-    """
-    Extracts patches from a multichannel 4D MRI image.
-    Args:
-        multi_channel_volume (torch.Tensor or numpy.ndarray): The 4D input image (C, D, H, W).
-        patch_size (tuple): Size of each patch (depth, height, width).
-        stride (tuple): Stride for patch extraction.
-        min_nonzero_ratio (float): Minimum ratio of non-zero voxels to include a patch.
-
-    Returns:
-        patches (list): List of patches, each a numpy array of shape (C, patch_d, patch_h, patch_w).
-        patch_coordinates (list): List of patch coordinates (start_d, start_h, start_w).
-    """
+def extract_patches(multi_channel_volume, patch_size=(8, 8, 8), stride=(8, 8, 8), min_nonzero_ratio=0.1):
     if isinstance(multi_channel_volume, torch.Tensor):
         volume = multi_channel_volume.cpu().numpy()
     else:
@@ -384,137 +297,58 @@ def extract_patches(
     C, D, H, W = volume.shape
     patch_d, patch_h, patch_w = patch_size
     stride_d, stride_h, stride_w = stride
-
-    patches = []
-    patch_coordinates = []
+    patches, patch_coordinates = [], []
 
     for d in range(0, D - patch_d + 1, stride_d):
         for h in range(0, H - patch_h + 1, stride_h):
             for w in range(0, W - patch_w + 1, stride_w):
-                patch = volume[:, d:d+patch_d, h:h+patch_h, w:w+patch_w]
-
-                # Check if patch has sufficient non-zero content
+                patch = volume[:, d : d + patch_d, h : h + patch_h, w : w + patch_w]
                 if np.count_nonzero(patch) / patch.size >= min_nonzero_ratio:
                     patches.append(patch)
                     patch_coordinates.append((d, h, w))
-
     return patches, patch_coordinates
 
 
 def get_patch_voxel_indices(coords, patch_size):
-    """
-    Get voxel indices for a patch.
-    Args:
-        coords (tuple): Patch coordinates (start_d, start_h, start_w).
-        patch_size (tuple): Patch size (patch_d, patch_h, patch_w).
-    Returns:
-        voxel_indices (numpy.ndarray): Array of voxel indices in the patch.
-    """
     start_d, start_h, start_w = coords
     patch_d, patch_h, patch_w = patch_size
     d_coords, h_coords, w_coords = np.meshgrid(
         np.arange(start_d, start_d + patch_d),
         np.arange(start_h, start_h + patch_h),
         np.arange(start_w, start_w + patch_w),
-        indexing='ij'
+        indexing="ij",
     )
     return np.column_stack([d_coords.flatten(), h_coords.flatten(), w_coords.flatten()])
 
 
 def get_patch_centroid(coords, patch_size):
-    """
-    Calculate the centroid of a patch.
-    Args:
-        coords (tuple): Patch coordinates (start_d, start_h, start_w).
-        patch_size (tuple): Patch size (patch_d, patch_h, patch_w).
-    Returns:
-        centroid (numpy.ndarray): Centroid coordinates.
-    """
     start_d, start_h, start_w = coords
     patch_d, patch_h, patch_w = patch_size
-    return np.array([
-        start_d + (patch_d - 1) / 2.0,
-        start_h + (patch_h - 1) / 2.0,
-        start_w + (patch_w - 1) / 2.0
-    ])
+    return np.array(
+        [start_d + (patch_d - 1) / 2.0, start_h + (patch_h - 1) / 2.0, start_w + (patch_w - 1) / 2.0]
+    )
 
 
 def get_patch_labels(coords, patch_size, truth):
-    """
-    Computes the label for a patch by majority voting using np.bincount.
-    This method mirrors the logic of finding a label for a supervoxel.
-
-    Args:
-        coords (tuple): Patch coordinates (start_d, start_h, start_w).
-        patch_size (tuple): Patch size (patch_d, patch_h, patch_w).
-        truth (torch.Tensor or numpy.ndarray): The ground truth label volume,
-            typically 4D (C, D, H, W). The labels are expected to be integers
-            corresponding to BraTS classes.
-
-    Returns:
-        patch_label (int): The majority label in the patch, corresponding to one of the
-            BraTS-2023 classes:
-            - 0: Non-tumorous area (NT)
-            - 1: Necrotic tumor core (NCR)
-            - 2: Peritumoral edematous/invaded tissue (ED)
-            - 3: GD-enhancing tumor (ET)
-    """
     start_d, start_h, start_w = coords
     patch_d, patch_h, patch_w = patch_size
-    
-    if isinstance(truth, torch.Tensor):
-        truth_np = truth.cpu().numpy()
-    else:
-        truth_np = np.asanyarray(truth) # Use asanyarray to avoid copying if already numpy
-
-    # 1. Extract the 3D label data for the patch from the first channel
-    patch_volume_labels = truth_np[0,
-        start_d : start_d + patch_d,
-        start_h : start_h + patch_h,
-        start_w : start_w + patch_w
-    ]
-
-    # 2. Flatten the 3D patch into a 1D array of voxel labels
+    truth_np = truth.cpu().numpy() if isinstance(truth, torch.Tensor) else np.asanyarray(truth)
+    patch_volume_labels = truth_np[0, start_d : start_d + patch_d, start_h : start_h + patch_h, start_w : start_w + patch_w]
     voxel_labels = patch_volume_labels.flatten()
-
-    # Edge case: if the patch is empty, return background label
     if voxel_labels.size == 0:
         return 0
-
-    # 3. Use np.bincount to count occurrences of each label and find the most frequent one (the majority)
-    # This is the exact same logic as in your get_node_labels function.
-    # We ensure the type is integer, as required by np.bincount.
-    majority_label = np.bincount(voxel_labels.astype(np.int64)).argmax()
-    
-    return majority_label
+    return np.bincount(voxel_labels.astype(np.int64)).argmax()
 
 
 def get_node_edges(centroids, k=10):
-    """
-    Computes graph edges using k-nearest neighbors on node centroids.
-    Args:
-        centroids (numpy.ndarray): List of node centroids.
-        k (int): Number of neighbor edges to keep for each node.
-    Returns:
-        edges (numpy.ndarray): The graph edges in shape (num_edges, 2).
-    """
     num_nodes = len(centroids)
     if num_nodes <= 1:
         return np.array([]).reshape(0, 2)
-    
-    # Ensure k is not greater than the number of possible neighbors
     k = min(k, num_nodes - 1)
-    
     if k <= 0:
         return np.array([]).reshape(0, 2)
-
-    # Find the k+1 nearest neighbors (the first one is the node itself)
-    nn = NearestNeighbors(n_neighbors=k + 1, algorithm='ball_tree').fit(centroids)
+    nn = NearestNeighbors(n_neighbors=k + 1, algorithm="ball_tree").fit(centroids)
     _, indices = nn.kneighbors(centroids)
-
-    # Create edge list
     rows = np.repeat(np.arange(num_nodes), k)
     cols = indices[:, 1:].flatten()
-    edges = np.stack([rows, cols], axis=1)
-
-    return edges
+    return np.stack([rows, cols], axis=1)

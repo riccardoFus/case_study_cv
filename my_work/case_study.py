@@ -34,8 +34,8 @@ from monai.transforms import (
 
 from src.helpers.graph import image_to_graph
 from src.my_work.graph2 import image_to_graph_2
-from src.my_work.graph3 import ViTAutoEncoder3D, image_to_graph_vit
-from src.my_work.training2 import train_vit_autoencoder
+from src.my_work.graph3 import ViT, image_to_graph_vit
+from src.my_work.training2 import train_vit_classifier
 
 data_path = "data\\glioma\\glioma\\ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData"
 
@@ -47,12 +47,12 @@ reports_path = "reports"
 logs_path = "logs"
 graph_path = "graph\\graphs"
 
-(
-	base_image_transform,
-	autoencoder_train_transform,
-	autoencoder_eval_transform,
-	_, _
-) = get_transformations()
+# (
+# 	base_image_transform,
+# 	autoencoder_train_transform,
+# 	autoencoder_eval_transform,
+# 	_, _
+# ) = get_transformations()
 
 # model = AutoEncoder3D(
 # spatial_dims=3,
@@ -70,59 +70,78 @@ train_data, eval_data, test_data = train_test_splitting(data_path, reports_path=
 
 ## NOTE: uncomment to execute the training phase.
 
-model = ViTAutoEncoder3D(
-	spatial_dims=3,
-	in_channels=4,
-	out_channels=4,
-    patch_size=(8,8,8),
+
+model = ViT(
+    in_channels=4,
     img_size=(112, 112, 72),
-    decoder_strides=(2,2,2)
+    patch_size=(8, 8, 8),
+    hidden_size=768,      # default transformer embedding dim
+    mlp_dim=3072,          # feed-forward layer size
+    num_layers=12,         # number of transformer blocks
+    num_heads=12,          # number of self-attention heads
+    classification=True,   # or False depending on your task
+    num_classes=4,         # this is your out_channels
+    dropout_rate=0.0,
+    spatial_dims=3
 )
 
+# --- Define the keys that the transforms will operate on ---
+# This should be done right before you define the transforms.
+transform_keys = ["image", "label"]
 
-# train_metrics = train_vit_autoencoder(
-# 	model = model,
-# 	train_files = train_data,
-#     val_files = eval_data,
-#     # Esempio di definizione della pipeline di trasformazione
-# 	train_transform = Compose([
-# 		LoadImaged(keys=["image"]),
-# 		EnsureChannelFirstd(keys=["image"]),
-# 		
-# 		# --- MODIFICA CHIAVE NELLA TRASFORMAZIONE ---
-# 		# Aggiungi il ridimensionamento qui. In questo modo le immagini vengono
-# 		# ridimensionate PRIMA di essere memorizzate nella cache su disco.
-# 		Resized(keys=["image"], spatial_size=(112, 112, 72), mode='trilinear', align_corners=False),
-# 		
-# 		# Esempio di altre trasformazioni che potresti avere
-# 		ScaleIntensityRanged(
-# 			keys=["image"], a_min=0.0, a_max=1.0, 
-# 			b_min=0.0, b_max=1.0, clip=True
-# 		),
-# 		# ... altre aumentazioni come RandFlipd, RandRotated, ecc.
-# 	]),
-# 
-# # Fai lo stesso per val_transform (senza le aumentazioni casuali)
-# 	val_transform = Compose([
-# 		LoadImaged(keys=["image"]),
-# 		EnsureChannelFirstd(keys=["image"]),
-# 		Resized(keys=["image"], spatial_size=(112, 112, 72), mode='trilinear', align_corners=False),
-# 		ScaleIntensityRanged(
-# 			keys=["image"], a_min=0.0, a_max=1.0, 
-# 			b_min=0.0, b_max=1.0, clip=True
-# 		),
-# 	]),
-# 	epochs = 10,
-# 	device = get_device(), # get_device(), # 'mps' not supported
-# 	output_paths = {
-#         'saved_path': saved_path,
-#         'reports_path' : reports_path,
-#         'logs_path' : logs_path
-# 	},
-# 	num_workers=0,
-# 	verbose = True,
-#     batch_size=1
-# )
+# --- Define the Training Transformation Pipeline ---
+train_transform = Compose([
+    # Load both image and label from their file paths
+    LoadImaged(keys=transform_keys),
+    
+    # Ensure both have a channel dimension (e.g., [1, D, H, W])
+    EnsureChannelFirstd(keys=transform_keys),
+    
+    # Resize the image using trilinear interpolation for smoothness
+    Resized(keys=["image"], spatial_size=(112, 112, 72), mode='trilinear', align_corners=False),
+    
+    # IMPORTANT: Resize the label mask using 'nearest' to preserve integer class values
+    Resized(keys=["label"], spatial_size=(112, 112, 72), mode='nearest'),
+    
+    # Scale only the image intensity (e.g., to [0, 1]), not the label
+    ScaleIntensityRanged(keys=["image"], a_min=0.0, a_max=1.0, b_min=0.0, b_max=1.0, clip=True),
+    
+    # Optional: Add data augmentation here for the training set
+    # e.g., RandFlipd(keys=transform_keys, prob=0.5, spatial_axis=0),
+])
+
+# --- Define the Validation Transformation Pipeline ---
+# This is similar to the training pipeline but typically without random augmentations.
+val_transform = Compose([
+    LoadImaged(keys=transform_keys),
+    EnsureChannelFirstd(keys=transform_keys),
+    Resized(keys=["image"], spatial_size=(112, 112, 72), mode='trilinear', align_corners=False),
+    Resized(keys=["label"], spatial_size=(112, 112, 72), mode='nearest'),
+    ScaleIntensityRanged(keys=["image"], a_min=0.0, a_max=1.0, b_min=0.0, b_max=1.0, clip=True),
+])
+
+
+# --- The Corrected Function Call ---
+# All arguments are now correctly formatted and passed to the function.
+train_metrics = train_vit_classifier(
+    model=model,
+    train_files=train_data,
+    val_files=eval_data,
+    train_transform=train_transform,  # Pass the pipeline object
+    val_transform=val_transform,      # Pass the pipeline object
+    epochs=10,
+    device=get_device(),
+    output_paths={
+        'saved_path': saved_path,
+        'reports_path': reports_path,
+        'logs_path': logs_path
+    },
+    num_workers=0,
+    verbose=True,
+    batch_size=1
+)
+
+raise Exception
 
 l = len(train_data) + len(eval_data) + len(test_data)
 data = np.concatenate([train_data, eval_data, test_data]).reshape(l)
